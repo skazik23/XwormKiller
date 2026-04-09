@@ -18,4 +18,5 @@ It performs deep system analysis, process monitoring, and automatic cleanup.
 © XeoTeam. All rights reserved.
 Telegram: @cmspip
 
-![Скриншот-20260409-024029](https://github.com/user-attachments/assets/cdb14e57-05cf-4388-9798-5f36bb5e0eb2)
+
+![Скриншот-20260409-222038](https://github.com/user-attachments/assets/e177eb45-bd1a-47b5-8d8c-e0e5cc4414ee)
