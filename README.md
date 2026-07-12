@@ -16,7 +16,7 @@ It performs deep system analysis, process monitoring, and automatic cleanup.
 - 🔄 Self-protection – prevents the tool from terminating itself
 
 © XeoTeam. All rights reserved.
-Telegram: @cmspip
+Telegram: @silidation
 
 
 ![Скриншот-20260409-222038](https://github.com/user-attachments/assets/e177eb45-bd1a-47b5-8d8c-e0e5cc4414ee)
