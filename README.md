@@ -6,6 +6,7 @@ XWorm RAT and similar Remote Access Trojans from infected Windows systems.
 It performs deep system analysis, process monitoring, and automatic cleanup.
 
 ## ✨ Features
+- 🛡️ Deep Protection (custom hunter) – auto-engages the moment the primary scan finds no trace of the RAT; a hard time-boxed (5–10s) parallel sweep of running processes, deep user-writable folders, script stubs, WMI event-consumer persistence and covert C2 owners, with automatic quarantine
 - 🧠 Weighted threat scoring – every process/file is scored across many signals instead of a single name match, drastically cutting false positives while catching more real threats
 - ✍️ Authenticode verification – validates digital signatures via WinVerifyTrust (full chain check, not just presence)
 - 📈 Entropy analysis – flags packed / encrypted payloads by measuring Shannon entropy

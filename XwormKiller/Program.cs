@@ -926,7 +926,7 @@ namespace WormKiller
         static void Main(string[] args)
         {
             currentPid = Process.GetCurrentProcess().Id;
-            Console.Title = "XwormKiller | tg: @cmspip";
+            Console.Title = "XwormKiller | telegram: @xeocoder";
             Console.WindowWidth = 130;
             Console.WindowHeight = 40;
             PrintBanner();
@@ -943,6 +943,15 @@ namespace WormKiller
             
             if (!foundAnything)
             {
+                // Primary analysis found no trace of where the RAT hides -
+                // instantly engage the custom Deep Protection hunter (5-10s).
+                bool deepFound = DeepProtection.Engage(
+                    TimeSpan.FromSeconds(8), currentPid, WriteColoredLine, KillProcess);
+                if (deepFound) foundAnything = true;
+            }
+
+            if (!foundAnything)
+            {
                 WriteColoredLine("Oh... Thank God you're clean, relax.");
                 Thread.Sleep(2000);
             }
@@ -950,7 +959,7 @@ namespace WormKiller
             {
                 Thread.Sleep(3000);
             }
-            
+
             ClearAndShowStatus();
             MonitorProcessesAndPorts();
             
