@@ -292,6 +292,197 @@ namespace WormKiller
             }
         }
 
+        // Acts on a weighted verdict: kill on Malicious, warn on Suspicious,
+        // quietly log low-confidence signals. This replaces the old "name
+        // contains a bad word -> kill" logic that endangered clean software.
+        static void HandleThreat(ThreatReport report, int pid, string name)
+        {
+            switch (report.Level)
+            {
+                case ThreatLevel.Malicious:
+                    WriteColoredLine($"[!!!] MALICIOUS: {report.Target} score={report.Score}");
+                    foreach (string r in report.Reasons) WriteColoredLine($"      - {r}");
+                    if (pid > 0) KillProcess(pid, name);
+                    foundAnything = true;
+                    break;
+                case ThreatLevel.Suspicious:
+                    WriteColoredLine($"[WARNING] SUSPICIOUS (not killed): {report.Target} score={report.Score}");
+                    foreach (string r in report.Reasons) WriteColoredLine($"      - {r}");
+                    foundAnything = true;
+                    break;
+                case ThreatLevel.Low:
+                    WriteColoredLine($"[i] Low-confidence signal on {report.Target} (score={report.Score})");
+                    break;
+            }
+        }
+
+        // Deep scan every running process: static file analysis + runtime
+        // signals + command-line + process-tree, scored per process.
+        static void DeepScanAllProcesses()
+        {
+            WriteColoredLine("[*] Deep-scanning all running processes (signatures, signature-check, entropy, injection)...");
+            Dictionary<int, ProcessMeta> meta = ThreatAnalyzer.SnapshotProcesses();
+
+            foreach (var proc in Process.GetProcesses())
+            {
+                try
+                {
+                    if (IsSelfProcess(proc.Id, proc.ProcessName)) continue;
+                    meta.TryGetValue(proc.Id, out ProcessMeta? pm);
+                    ThreatReport report = ThreatAnalyzer.AnalyzeProcess(proc, pm);
+                    HandleThreat(report, proc.Id, proc.ProcessName);
+                }
+                catch { }
+            }
+        }
+
+        // Analyze live network connections. Established links to routable
+        // remote hosts on known RAT ports are strong C2 evidence; we score
+        // the owning process rather than blindly killing by port number.
+        static void AnalyzeNetworkConnections()
+        {
+            WriteColoredLine("[*] Analyzing active network connections for C2 channels...");
+            List<NetConnection> conns = NetworkInspector.GetConnections();
+            Dictionary<int, ProcessMeta> meta = ThreatAnalyzer.SnapshotProcesses();
+
+            foreach (var c in conns)
+            {
+                if (c.Protocol != "TCP") continue;
+
+                bool established = c.State.Equals("ESTABLISHED", StringComparison.OrdinalIgnoreCase);
+                bool listeningRat = c.State.Equals("LISTENING", StringComparison.OrdinalIgnoreCase) &&
+                                    NetworkInspector.IsRatPort(c.LocalPort);
+                bool c2Link = established && NetworkInspector.IsRatPort(c.RemotePort) &&
+                              NetworkInspector.IsRoutableRemote(c.RemoteAddress);
+
+                if (!listeningRat && !c2Link) continue;
+                if (c.Pid <= 0 || IsSelfProcessPid(c.Pid)) continue;
+
+                Process proc;
+                try { proc = Process.GetProcessById(c.Pid); }
+                catch { continue; }
+
+                var report = ThreatAnalyzer.AnalyzeProcess(proc, meta.TryGetValue(c.Pid, out var pm) ? pm : null);
+
+                if (c2Link)
+                {
+                    report.Add(50, $"ESTABLISHED C2 link to {c.RemoteAddress}:{c.RemotePort}");
+                    WriteColoredLine($"[!!!] Active C2 channel: {proc.ProcessName} (PID {c.Pid}) -> {c.RemoteAddress}:{c.RemotePort}");
+                }
+                if (listeningRat)
+                    report.Add(25, $"listening on RAT port {c.LocalPort}");
+
+                HandleThreat(report, c.Pid, proc.ProcessName);
+            }
+        }
+
+        static bool IsSelfProcessPid(int pid)
+        {
+            if (pid == currentPid) return true;
+            try { return IsSelfProcess(pid, Process.GetProcessById(pid).ProcessName); }
+            catch { return false; }
+        }
+
+        static bool ProcessStillAlive(int pid)
+        {
+            try { Process.GetProcessById(pid); return true; }
+            catch { return false; }
+        }
+
+        // Detects Image File Execution Options debugger hijacks - a stealth
+        // persistence/defense-evasion trick that points a legit binary at a RAT.
+        static void AnalyzeIfeoHijacks()
+        {
+            WriteColoredLine("[*] Checking Image File Execution Options for debugger hijacks...");
+            const string ifeo = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+            try
+            {
+                using RegistryKey? root = Registry.LocalMachine.OpenSubKey(ifeo, true);
+                if (root == null) return;
+                foreach (string sub in root.GetSubKeyNames())
+                {
+                    try
+                    {
+                        using RegistryKey? k = root.OpenSubKey(sub, true);
+                        string? dbg = k?.GetValue("Debugger")?.ToString();
+                        if (!string.IsNullOrEmpty(dbg))
+                        {
+                            string lower = dbg.ToLowerInvariant();
+                            // A legitimate debugger lives in system dirs; RAT
+                            // hijacks point at temp/appdata or a scripting host.
+                            if (ThreatAnalyzer.LooksSuspiciousLocation(lower) ||
+                                lower.Contains("powershell") || lower.Contains("cmd") ||
+                                lower.Contains("mshta") || lower.Contains("wscript"))
+                            {
+                                WriteColoredLine($"[!!!] IFEO debugger hijack on '{sub}' -> {dbg}");
+                                k?.DeleteValue("Debugger");
+                                foundAnything = true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        static readonly string[] AutorunBadKeywords =
+            { "worm", "rat", "xworm", "svhost", "winupdate", "mscoree" };
+
+        // Extracts the executable path from an autorun/command-line value.
+        static string ExtractExecutablePath(string commandLine)
+        {
+            if (string.IsNullOrEmpty(commandLine)) return "";
+            string s = commandLine.Trim();
+            if (s.StartsWith("\""))
+            {
+                int end = s.IndexOf('"', 1);
+                if (end > 1) return s.Substring(1, end - 1);
+            }
+            int space = s.IndexOf(' ');
+            return space > 0 ? s.Substring(0, space) : s;
+        }
+
+        // Inspects one autorun value: keyword match first, then deep static
+        // analysis of the referenced binary so benign-looking entries that
+        // point at a real payload are still caught. Returns true if removed.
+        static bool InspectAndCleanAutorun(RegistryKey key, string valueName, string scope)
+        {
+            string? raw = key.GetValue(valueName)?.ToString();
+            if (string.IsNullOrEmpty(raw)) return false;
+            string lower = raw.ToLowerInvariant();
+
+            foreach (string bad in AutorunBadKeywords)
+            {
+                if (lower.Contains(bad))
+                {
+                    try { key.DeleteValue(valueName); } catch { }
+                    WriteColoredLine($"[+] Deleted autorun{scope}: {valueName} -> {raw}");
+                    foundAnything = true;
+                    return true;
+                }
+            }
+
+            string path = ExtractExecutablePath(raw);
+            if (!string.IsNullOrEmpty(path))
+            {
+                ThreatReport report = ThreatAnalyzer.AnalyzeFile(path);
+                if (report.Level >= ThreatLevel.Suspicious)
+                {
+                    WriteColoredLine($"[!!!] Malicious autorun target{scope}: {valueName} -> {raw} (score={report.Score})");
+                    foreach (string r in report.Reasons) WriteColoredLine($"      - {r}");
+                    foundAnything = true;
+                    if (report.Level == ThreatLevel.Malicious)
+                    {
+                        try { key.DeleteValue(valueName); } catch { }
+                        WriteColoredLine($"[+] Deleted autorun{scope}: {valueName}");
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         static void RemoveAutoRun()
         {
             WriteColoredLine("[*] Cleaning autorun registry...");
@@ -315,22 +506,7 @@ namespace WormKiller
                         if (key != null)
                         {
                             foreach (string valueName in key.GetValueNames())
-                            {
-                                string value = key.GetValue(valueName)?.ToString().ToLower();
-                                if (value != null)
-                                {
-                                    foreach (string bad in badKeywords)
-                                    {
-                                        if (value.Contains(bad))
-                                        {
-                                            key.DeleteValue(valueName);
-                                            WriteColoredLine($"[+] Deleted autorun: {valueName} -> {value}");
-                                            foundAnything = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                                InspectAndCleanAutorun(key, valueName, "");
                         }
                     }
                 }
@@ -344,22 +520,7 @@ namespace WormKiller
                         if (key != null)
                         {
                             foreach (string valueName in key.GetValueNames())
-                            {
-                                string value = key.GetValue(valueName)?.ToString().ToLower();
-                                if (value != null)
-                                {
-                                    foreach (string bad in badKeywords)
-                                    {
-                                        if (value.Contains(bad))
-                                        {
-                                            key.DeleteValue(valueName);
-                                            WriteColoredLine($"[+] Deleted autorun (current user): {valueName} -> {value}");
-                                            foundAnything = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                                InspectAndCleanAutorun(key, valueName, " (current user)");
                         }
                     }
                 }
@@ -400,46 +561,97 @@ namespace WormKiller
 
         static void CleanTaskScheduler()
         {
-            WriteColoredLine("[*] Scanning Task Scheduler...");
+            WriteColoredLine("[*] Scanning Task Scheduler (name + action target analysis)...");
             try
             {
+                // Verbose list output exposes "Task To Run", the actual command
+                // a task executes - so we can analyze the referenced binary
+                // instead of guessing from the task name alone.
                 Process process = new Process();
                 process.StartInfo.FileName = "schtasks.exe";
-                process.StartInfo.Arguments = "/query /fo csv /nh";
+                process.StartInfo.Arguments = "/query /v /fo list";
                 process.StartInfo.UseShellExecute = false;
                 process.StartInfo.RedirectStandardOutput = true;
                 process.StartInfo.CreateNoWindow = true;
                 process.Start();
                 string output = process.StandardOutput.ReadToEnd();
                 process.WaitForExit();
-                
-                string[] lines = output.Split('\n');
-                string[] badTasks = { "worm", "rat", "xworm", "update", "java", "client", "server", "mscoree" };
-                
-                foreach (string line in lines)
+
+                // High-signal name keywords only - dropped the FP-prone
+                // "update"/"java"/"client"/"server" that matched Windows tasks.
+                string[] badNameKeywords = { "worm", "rat", "xworm", "mscoree", "svhost" };
+
+                string currentTaskName = "";
+                string currentTaskToRun = "";
+
+                foreach (string raw in output.Split('\n'))
                 {
-                    foreach (string bad in badTasks)
+                    string line = raw.TrimEnd('\r');
+                    if (line.StartsWith("TaskName:", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (line.ToLower().Contains(bad))
-                        {
-                            string taskName = line.Split(',')[0].Replace("\"", "");
-                            if (!string.IsNullOrEmpty(taskName) && taskName != "TaskName")
-                            {
-                                Process deleteTask = new Process();
-                                deleteTask.StartInfo.FileName = "schtasks.exe";
-                                deleteTask.StartInfo.Arguments = $"/delete /tn \"{taskName}\" /f";
-                                deleteTask.StartInfo.CreateNoWindow = true;
-                                deleteTask.Start();
-                                deleteTask.WaitForExit();
-                                WriteColoredLine($"[+] Deleted scheduled task: {taskName}");
-                                foundAnything = true;
-                            }
-                            break;
-                        }
+                        // New task block: evaluate the previous one first.
+                        EvaluateScheduledTask(currentTaskName, currentTaskToRun, badNameKeywords);
+                        currentTaskName = line.Substring("TaskName:".Length).Trim();
+                        currentTaskToRun = "";
+                    }
+                    else if (line.StartsWith("Task To Run:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentTaskToRun = line.Substring("Task To Run:".Length).Trim();
+                    }
+                }
+                EvaluateScheduledTask(currentTaskName, currentTaskToRun, badNameKeywords);
+            }
+            catch { }
+        }
+
+        static void EvaluateScheduledTask(string taskName, string taskToRun, string[] badNameKeywords)
+        {
+            if (string.IsNullOrEmpty(taskName)) return;
+
+            string haystack = (taskName + " " + taskToRun).ToLowerInvariant();
+            bool malicious = false;
+            string why = "";
+
+            foreach (string bad in badNameKeywords)
+            {
+                if (haystack.Contains(bad)) { malicious = true; why = $"name/command matches '{bad}'"; break; }
+            }
+
+            // Deep: analyze the binary the task actually launches.
+            if (!malicious && !string.IsNullOrEmpty(taskToRun))
+            {
+                string path = ExtractExecutablePath(taskToRun);
+                if (!string.IsNullOrEmpty(path))
+                {
+                    ThreatReport report = ThreatAnalyzer.AnalyzeFile(path);
+                    if (report.Level == ThreatLevel.Malicious)
+                    {
+                        malicious = true;
+                        why = $"action target scored {report.Score}";
+                    }
+                    else if (report.Level == ThreatLevel.Suspicious)
+                    {
+                        WriteColoredLine($"[WARNING] Suspicious scheduled task (not deleted): {taskName} -> {taskToRun} (score={report.Score})");
+                        foundAnything = true;
                     }
                 }
             }
-            catch { }
+
+            if (malicious)
+            {
+                try
+                {
+                    Process deleteTask = new Process();
+                    deleteTask.StartInfo.FileName = "schtasks.exe";
+                    deleteTask.StartInfo.Arguments = $"/delete /tn \"{taskName}\" /f";
+                    deleteTask.StartInfo.CreateNoWindow = true;
+                    deleteTask.Start();
+                    deleteTask.WaitForExit();
+                }
+                catch { }
+                WriteColoredLine($"[+] Deleted scheduled task: {taskName} ({why})");
+                foundAnything = true;
+            }
         }
 
         static void CleanCache()
@@ -605,41 +817,56 @@ namespace WormKiller
         static void MonitorProcessesAndPorts()
         {
             HashSet<int> seenPids = new HashSet<int>();
-            string[] badNames = { "worm", "rat", "client", "server", "xworm", "svhost", "winupdate", "mscoree" };
-            
+
             Thread processMonitor = new Thread(() =>
             {
                 while (true)
                 {
                     try
                     {
+                        // Periodic full deep sweep: every process re-scored plus
+                        // live network connection analysis for C2 channels.
                         if (DateTime.Now - lastDeepAnalyze >= deepAnalyzeInterval)
                         {
                             AnalyzeSystemProcesses();
+                            DeepScanAllProcesses();
+                            AnalyzeNetworkConnections();
+                            AnalyzeIfeoHijacks();
                             lastDeepAnalyze = DateTime.Now;
                         }
-                        
+
+                        // Fast path: fully analyze only freshly-appeared processes
+                        // so newly-launched payloads are caught within ~1 second.
+                        var newProcs = new List<Process>();
                         foreach (var proc in Process.GetProcesses())
                         {
                             try
                             {
-                                if (!seenPids.Contains(proc.Id))
-                                {
-                                    seenPids.Add(proc.Id);
-                                    string name = proc.ProcessName.ToLower();
-                                    foreach (string bad in badNames)
-                                    {
-                                        if (name.Contains(bad) && !IsSelfProcess(proc.Id, proc.ProcessName))
-                                        {
-                                            WriteColoredLine($"[ALERT] New malicious process detected: {proc.ProcessName} (PID: {proc.Id})");
-                                            KillProcess(proc.Id, proc.ProcessName);
-                                            break;
-                                        }
-                                    }
-                                }
+                                if (seenPids.Add(proc.Id) && !IsSelfProcess(proc.Id, proc.ProcessName))
+                                    newProcs.Add(proc);
                             }
                             catch { }
                         }
+
+                        if (newProcs.Count > 0)
+                        {
+                            Dictionary<int, ProcessMeta> meta = ThreatAnalyzer.SnapshotProcesses();
+                            foreach (var proc in newProcs)
+                            {
+                                try
+                                {
+                                    meta.TryGetValue(proc.Id, out ProcessMeta? pm);
+                                    ThreatReport report = ThreatAnalyzer.AnalyzeProcess(proc, pm);
+                                    if (report.Level >= ThreatLevel.Low)
+                                        HandleThreat(report, proc.Id, proc.ProcessName);
+                                }
+                                catch { }
+                            }
+                        }
+
+                        // Forget dead PIDs so a recycled PID gets re-analyzed.
+                        seenPids.RemoveWhere(pid => !ProcessStillAlive(pid));
+
                         Thread.Sleep(1000);
                     }
                     catch { }
@@ -705,10 +932,13 @@ namespace WormKiller
             PrintBanner();
             
             RemoveAutoRun();
+            AnalyzeIfeoHijacks();
             CleanTaskScheduler();
             CleanCache();
             BlockRatPorts();
             AnalyzeSystemProcesses();
+            DeepScanAllProcesses();
+            AnalyzeNetworkConnections();
             FindAndFuckRatPorts();
             
             if (!foundAnything)
