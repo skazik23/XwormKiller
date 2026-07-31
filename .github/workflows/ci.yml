@@ -1,0 +1,28 @@
+name: CI
+
+# Compile-checks every push and pull request against main so build breaks are
+# caught early (the project targets net8.0-windows, so it builds on Windows).
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore XwormKiller/XwormKiller.csproj
+
+      - name: Build (Release)
+        run: dotnet build XwormKiller/XwormKiller.csproj -c Release --no-restore

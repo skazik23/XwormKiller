@@ -1,0 +1,75 @@
+name: Build and Release
+
+# Builds a self-contained single-file Windows x64 executable and publishes it
+# as a GitHub Release asset.
+#
+# Triggers:
+#   * push a tag like v1.1.0            -> builds and releases that tag
+#   * run manually (workflow_dispatch)  -> enter a tag; it is created if missing
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/update (e.g. v1.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore XwormKiller/XwormKiller.csproj
+
+      - name: Publish (self-contained, single file, win-x64)
+        run: >
+          dotnet publish XwormKiller/XwormKiller.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -o publish
+
+      - name: Package archive
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath XwormKiller-win-x64.zip -Force
+
+      - name: Resolve tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "tag=${{ github.event.inputs.tag }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "tag=${{ github.ref_name }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Create or update release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag XwormKiller-win-x64.zip `
+              --title "XwormKiller $tag" `
+              --notes "Automated build of XwormKiller ($tag). Self-contained Windows x64 executable - no .NET runtime required. Run as Administrator."
+          } else {
+            gh release upload $tag XwormKiller-win-x64.zip --clobber
+          }

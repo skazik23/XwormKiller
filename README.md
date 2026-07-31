@@ -23,8 +23,24 @@ It performs deep system analysis, process monitoring, and automatic cleanup.
 - 🎨 Colored console output – intuitive visual feedback with color-coded warnings
 - 🔄 Self-protection – prevents the tool from terminating itself
 
+## 🏗️ Build & Release
+- **Local build (Windows + .NET 8 SDK):**
+  ```bash
+  dotnet publish XwormKiller/XwormKiller.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+  ```
+- **Automated release (GitHub Actions):** push a version tag and CI builds the
+  self-contained `win-x64` executable and attaches it to a GitHub Release:
+  ```bash
+  git tag v1.1.0
+  git push origin v1.1.0
+  ```
+  You can also trigger it manually from the **Actions → Build and Release** tab.
+
+## ✅ Requirements
+- Windows 10/11 (x64), run as **Administrator**
+
 © XeoTeam. All rights reserved.
-Telegram: @silidation
+Telegram: @xeocoder
 
 
 ![Скриншот-20260409-222038](https://github.com/user-attachments/assets/e177eb45-bd1a-47b5-8d8c-e0e5cc4414ee)
