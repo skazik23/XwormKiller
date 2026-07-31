@@ -6,7 +6,6 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <SupportedOSPlatformVersion>10.0</SupportedOSPlatformVersion>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
